@@ -3,7 +3,7 @@ import torch.nn as nn
 import os
 import numpy as np
 from torch.autograd import Variable
-from reward_model import Critic, Reward
+from utils.reward_model import Critic, Reward
 import torch.optim as optim
 from collections import deque
 
@@ -31,8 +31,8 @@ class RewardFunction():
         self.activate_function = activation_function_list[args.activate_function]
         self.last_activate_function = activation_function_list[args.last_activate_function]
         self.device = device
-        self.state_dim = env.observation_space.shape
-        self.action_dim = env.action_space.shape
+        self.state_dim = int(np.prod(env.single_observation_space.shape))
+        self.action_dim = int(np.prod(env.single_action_space.shape))
         # Value function V(s) used to approximate standard state values
         self.value_function = Critic(layer_num=3, input_dim=self.state_dim, output_dim=1,\
                                     hidden_dim=self.hidden_dim,
@@ -77,6 +77,8 @@ class RewardFunction():
         accumulator_1, accumulator_2 = [], []
         for step in D_new: 
             s, a, reward_hat, log_probs, mu, overline_V = step # tau
+            if mu is None:
+                continue
             states_batch.append(s)
             overline_V_batch.append(overline_V)
             # compute π(a|s) using the policy distribution
@@ -86,7 +88,8 @@ class RewardFunction():
             # compute the first term of the gradient
             accumulator_2.append(prob_a * (overline_V - V_s))
             # sample actions from action space
-            action_bs, log_probs_action_bs = agent.get_action_prob_from_mu(mu, self.n_samples)
+            normal = mu[1]
+            action_bs, log_probs_action_bs = agent.get_action_prob_from_mu(normal, self.n_samples)
             # compute reward for sampled actions
             s_expanded = torch.tensor(np.tile(s, (self.n_samples, 1)), dtype=torch.float32, device=self.device)
             reward_bs = self.reward_function(s_expanded, action_bs)
@@ -126,6 +129,7 @@ class RewardFunction():
         Returns:
             A new list of steps with computed overline_V added to each step.
         """
+        overline_V = 0.0
         new_epidata = []
         for step in reversed(epidata):
             overline_V = step.reward + self.gamma * overline_V

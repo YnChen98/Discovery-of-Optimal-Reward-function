@@ -5,6 +5,9 @@ import time
 from dataclasses import dataclass
 
 import gymnasium as gym
+from gymnasium import spaces
+from gymnasium.wrappers import FlattenObservation
+import PyFlyt.gym_envs
 import numpy as np
 import torch
 import torch.nn as nn
@@ -83,6 +86,53 @@ class Args:
     """the size of the reward-specific buffer"""
 
 
+class PadTargetDeltasToBox(gym.ObservationWrapper):
+    """
+    将 PyFlyt/QuadX-Waypoints 的观测从:
+      Dict(attitude: Box(21,), target_deltas: Sequence(Box(3,), stack=True))
+    转换成:
+      Dict(attitude: Box(21,), target_deltas: Box((K,3)))
+    其中 K=max_targets，序列不足补 0，超过则截断。
+    """
+
+    def __init__(self, env, max_targets: int = 10):
+        super().__init__(env)
+        self.max_targets = max_targets
+
+        att_space = env.observation_space["attitude"]  # Box(21,)
+        # 每个 target_delta 是 3 维，范围按原空间大致给个合理值（不影响算法，只是 space 定义）
+        self.observation_space = spaces.Dict(
+            {
+                "attitude": spaces.Box(
+                    low=-np.inf, high=np.inf,
+                    shape=att_space.shape,
+                    dtype=np.float32,
+                ),
+                "target_deltas": spaces.Box(
+                    low=-np.inf, high=np.inf,
+                    shape=(max_targets, 3),
+                    dtype=np.float32,
+                ),
+            }
+        )
+
+    def observation(self, obs):
+        att = np.asarray(obs["attitude"], dtype=np.float32)
+
+        seq = obs["target_deltas"]
+        # seq 可能是 list/np.array，统一成 (N,3)
+        arr = np.asarray(seq, dtype=np.float32).reshape(-1, 3) if len(seq) else np.zeros((0, 3), dtype=np.float32)
+
+        K = self.max_targets
+        padded = np.zeros((K, 3), dtype=np.float32)
+        n = min(arr.shape[0], K)
+        if n > 0:
+            padded[:n, :] = arr[:n, :]
+
+        return {"attitude": att, "target_deltas": padded}
+
+
+
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
@@ -91,6 +141,9 @@ def make_env(env_id, seed, idx, capture_video, run_name):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
+
+        env = PadTargetDeltasToBox(env, max_targets=10)
+        env = FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.action_space.seed(seed)
         return env
@@ -221,7 +274,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
-
+   
     actor = Actor(envs).to(device)
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)
@@ -259,19 +312,21 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
-        # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            log_prob = torch.zeros((envs.num_envs, 1), device=device)
+            mu = None
         else:
-            actions, log_prob, mean, mu = actor.get_action(torch.Tensor(obs).to(device))
-            actions = actions.detach().cpu().numpy()
+            with torch.no_grad():
+                actions_t, log_prob, mean, mu = actor.get_action(torch.tensor(obs, dtype=torch.float32, device=device))
+            actions = actions_t.cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, _, terminations, truncations, infos = envs.step(actions)
         
         # reward_orig = rewards
         with torch.no_grad():
-            rewards = reward_function.observe_reward(obs, actions, next_obs)
+            rewards = reward_function.ovserve_reward(obs, actions, next_obs)
             transition = Transition(state=obs, action=actions, reward=rewards, log_probs=log_prob, mu=mu, overline_V=0.0)
             epidata.append(transition)
 
@@ -298,15 +353,22 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _, _ = actor.get_action(data.next_observations)
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = qf2(data.observations, data.actions).view(-1)
+            obs_b = data.observations.to(device).float()
+            act_b = data.actions.to(device).float()
+            next_obs_b = data.next_observations.to(device).float()
+            rew_b = data.rewards.to(device).float().flatten()
+            done_b = data.dones.to(device).float().flatten()
+
+            with torch.no_grad():
+                next_state_actions, next_state_log_pi, _, _ = actor.get_action(next_obs_b)
+                qf1_next_target = qf1_target(next_obs_b, next_state_actions)
+                qf2_next_target = qf2_target(next_obs_b, next_state_actions)
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                next_q_value = rew_b + (1 - done_b) * args.gamma * min_qf_next_target.view(-1)
+
+            qf1_a_values = qf1(obs_b, act_b).view(-1)
+            qf2_a_values = qf2(obs_b, act_b).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
@@ -320,7 +382,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
+                    pi, log_pi, _, _ = actor.get_action(obs_b)
                     qf1_pi = qf1(data.observations, pi)
                     qf2_pi = qf2(data.observations, pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
@@ -332,7 +394,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
+                            _, log_pi, _, _ = actor.get_action(obs_b)
                         alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
                         a_optimizer.zero_grad()

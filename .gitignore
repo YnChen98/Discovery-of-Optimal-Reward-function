@@ -1,0 +1,13 @@
+# venv
+.venv*/
+.venv_pyflyt/
+.venv_sb3/
+
+# python cache
+__pycache__/
+*.py[cod]
+
+# outputs
+runs/
+videos/
+checkpoints/
